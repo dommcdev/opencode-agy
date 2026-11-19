@@ -4,7 +4,6 @@ import type {
   LanguageModelV3,
   LanguageModelV3CallOptions,
   LanguageModelV3Content,
-  LanguageModelV3FunctionTool,
   LanguageModelV3StreamPart,
   LanguageModelV3StreamResult,
 } from "@ai-sdk/provider"
@@ -12,6 +11,9 @@ import { PROVIDER_ID, type Kind, type Runtime } from "./runtime.ts"
 
 export const KIND_HEADER = "x-opencode-agy-kind"
 export const SESSION_HEADER = "x-opencode-session-id"
+/** Provider options set by the plugin's `context` hook. */
+export const AGENT_OPTION = "agyAgent"
+export const INSTRUCTIONS_OPTION = "agyInstructions"
 
 export class AgyLanguageModel implements LanguageModelV3 {
   readonly specificationVersion = "v3"
@@ -27,17 +29,13 @@ export class AgyLanguageModel implements LanguageModelV3 {
     const { stream } = await this.doStream(options)
     const content: LanguageModelV3Content[] = []
     let text = ""
-    let reasoning = ""
     let finish: Extract<LanguageModelV3StreamPart, { type: "finish" }> | undefined
     for await (const part of stream as any as AsyncIterable<LanguageModelV3StreamPart>) {
       if (part.type === "text-delta") text += part.delta
-      if (part.type === "reasoning-delta") reasoning += part.delta
-      if (part.type === "tool-call") content.push(part)
       if (part.type === "finish") finish = part
       if (part.type === "error") throw part.error
     }
-    if (reasoning) content.unshift({ type: "reasoning", text: reasoning })
-    if (text) content.unshift({ type: "text", text })
+    if (text) content.push({ type: "text", text })
     return {
       content,
       finishReason: finish?.finishReason ?? { unified: "stop" as const, raw: undefined },
@@ -55,15 +53,15 @@ export class AgyLanguageModel implements LanguageModelV3 {
     const headers = options.headers ?? {}
     const kind = headers[KIND_HEADER] as Kind | undefined
     const settings = (options.providerOptions?.[PROVIDER_ID] ?? {}) as Record<string, unknown>
-    const tools =
-      options.toolChoice?.type === "none"
-        ? []
-        : (options.tools ?? []).filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
-    // agy's own base prompt is replaced by the custom agent, so opencode's full system prompt applies.
-    const system = options.prompt
-      .filter((message) => message.role === "system")
-      .map((message) => message.content)
-      .join("\n\n")
+    const text = (value: unknown) => (typeof value === "string" ? value : undefined)
+    if (process.env.OPENCODE_AGY_DUMP) {
+      const { mkdirSync, writeFileSync } = await import("node:fs")
+      mkdirSync(process.env.OPENCODE_AGY_DUMP, { recursive: true })
+      writeFileSync(
+        `${process.env.OPENCODE_AGY_DUMP}/${Date.now()}-${kind ?? "unknown"}.json`,
+        JSON.stringify({ model: this.modelId, kind, headers, prompt: options.prompt, providerOptions: options.providerOptions }, null, 1),
+      )
+    }
     let cancelled = false
     let task: Promise<void> | undefined
     const stream = new ReadableStream<LanguageModelV3StreamPart>({
@@ -73,11 +71,11 @@ export class AgyLanguageModel implements LanguageModelV3 {
           .run({
             kind: kind ?? (headers[SESSION_HEADER] ? "primary" : undefined),
             sessionID: headers[SESSION_HEADER],
+            agent: text(settings[AGENT_OPTION]),
             model: this.modelId,
-            effort: typeof settings.effort === "string" ? settings.effort : undefined,
-            system,
+            effort: text(settings.effort),
+            instructions: text(settings[INSTRUCTIONS_OPTION]) ?? "",
             prompt: options.prompt,
-            tools,
             signal,
             emit: (part) => {
               if (!cancelled) controller.enqueue(part)

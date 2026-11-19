@@ -1,46 +1,49 @@
-// Runs opencode model requests through `agy acp`.
+// Runs opencode model requests through `agy acp`, Antigravity CLI's official Agent Client Protocol server.
 //
-// - One `agy acp` process serves the whole opencode server; each opencode session maps to one ACP session.
-// - agy runs with a private home and a custom main agent whose `tools: []` removes Antigravity's built-in tools.
-//   opencode's tools reach the model over MCP, so opencode runs every tool itself (permissions, UI, history).
-// - When the model calls a tool, the MCP request is held, the opencode step ends with a tool call, and the result
-//   opencode sends with its next request answers the held MCP request. The agy turn keeps running throughout, so a
-//   tool round trip costs no extra model request.
+// agy stays the agent: its own system prompt, tools, slash commands and model behaviour, exactly as in the terminal
+// or in the editors Google supports (Zed, JetBrains, t3code). opencode is the client: it shows agy's replies,
+// thinking and tool calls, answers agy's permission prompts through opencode's own permission rules, and keeps the
+// session history. opencode's own system prompt and tools are never sent to agy.
+//
+// - One `agy acp` process serves the whole plugin instance; each opencode session maps to one ACP session.
+// - agy runs with a private home, so ~/.gemini settings, rules, skills, hooks and MCP servers don't apply.
 // - opencode's history stays the source of truth. agy only receives input it has not seen.
 
-import type { LanguageModelV3FunctionTool, LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider"
-import { randomBytes, randomUUID } from "node:crypto"
+import type { LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { tmpdir } from "node:os"
 import { AcpError, AcpProcess, type PermissionRequest, type SessionUpdate } from "./agy/acp.ts"
 import * as Home from "./agy/home.ts"
 import * as Convert from "./convert.ts"
 import * as Fingerprint from "./sync/fingerprint.ts"
-import * as Names from "./tools/names.ts"
-import { ToolServer, type CallToolResult, type ToolDefinition } from "./tools/server.ts"
 
 export const PROVIDER_ID = "agy"
 // The live agy session of an opencode session closes after this long without requests; the next one resumes it.
 const IDLE_MS = 10 * 60_000
-// agy fails MCP tool calls after 3 minutes. A tool that runs longer in opencode (permission prompts, questions,
-// subagents, long commands) is detached before that: the agy turn is cancelled and the result arrives as the next
-// prompt, so the model never sees a timeout and never re-runs the tool on its own.
-const TOOL_DEADLINE_MS = Number(process.env.OPENCODE_AGY_TOOL_DEADLINE_MS) || 170_000
-// Parallel calls from one model response reach the MCP server within milliseconds of each other.
-const TOOL_BATCH_MS = 150
 
 export type Kind = "primary" | "title" | "generate" | "compaction"
 
 export interface Request {
   readonly kind: Kind | undefined
   readonly sessionID: string | undefined
+  readonly agent: string | undefined
   readonly model: string
   readonly effort: string | undefined
-  readonly system: string
+  /** The user's own instruction files (AGENTS.md and configured instructions), appended to agy's prompt. */
+  readonly instructions: string
   readonly prompt: LanguageModelV3Prompt
-  readonly tools: readonly LanguageModelV3FunctionTool[]
   readonly emit: (part: LanguageModelV3StreamPart) => void
   readonly signal: AbortSignal
 }
+
+/** Asks opencode whether agy may do something. Resolves true to allow. */
+export type Ask = (input: {
+  readonly sessionID: string
+  readonly agent: string | undefined
+  readonly action: string
+  readonly resources: string[]
+  readonly save?: string[]
+  readonly metadata?: Record<string, unknown>
+}) => Promise<boolean>
 
 interface SessionRecord {
   acpID: string
@@ -48,17 +51,8 @@ interface SessionRecord {
   history: string[]
 }
 
-interface HeldCall {
-  readonly id: string
-  readonly name: string
-  readonly input: Record<string, unknown>
-  readonly resolve: (result: CallToolResult) => void
-}
-
 type TurnEvent =
   | { type: "update"; update: SessionUpdate }
-  | { type: "call"; call: HeldCall }
-  | { type: "flush" }
   | { type: "abort" }
   | { type: "end"; result?: any; error?: unknown }
 
@@ -67,25 +61,20 @@ interface Turn {
   wake?: () => void
   ended: boolean
   readonly done: PromiseWithResolvers<void>
-  // agy tool_call ids for opencode tools, waiting to be matched with their MCP request
-  readonly announced: Array<{ id: string; name: string; input: unknown }>
-  readonly held: Map<string, HeldCall>
-  deadline?: ReturnType<typeof setTimeout>
 }
 
 interface Live {
   acpID: string
-  readonly key: string
-  readonly systemHash: string
-  readonly toolsHash: string
+  sessionID?: string
+  agent?: string
+  instructionsHash: string
   model?: string
   effort?: string
-  tools: readonly LanguageModelV3FunctionTool[]
+  mode?: string
   turn?: Turn
   title?: string
   used?: number
   unsubscribe: () => void
-  unregister: () => void
 }
 
 interface Entry {
@@ -93,8 +82,6 @@ interface Entry {
   record?: SessionRecord
   live?: Live
   idle?: ReturnType<typeof setTimeout>
-  // Tool calls of a turn that was detached at the tool deadline; their results lead the next prompt.
-  detached?: Set<string>
   readonly titleWaiters: Array<(title: string) => void>
 }
 
@@ -107,31 +94,14 @@ export interface Options {
   readonly directory: string
   readonly storage: Storage
   readonly executable: () => string | undefined
+  readonly ask: Ask
   readonly env?: NodeJS.ProcessEnv
   readonly log?: (message: string) => void
 }
 
-function definitions(tools: readonly LanguageModelV3FunctionTool[]): ToolDefinition[] {
-  return tools.map((tool) => ({
-    name: Names.short(tool.name),
-    description: tool.description ?? "",
-    inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
-  }))
-}
-
-function stripSummary(input: unknown) {
-  if (!input || typeof input !== "object") return input
-  const copy = { ...(input as Record<string, unknown>) }
-  delete copy.toolSummary
-  return copy
-}
-
-const same = (a: unknown, b: unknown) => Fingerprint.hash(a) === Fingerprint.hash(b)
-
 export class Runtime {
   private process?: AcpProcess
   private starting?: Promise<AcpProcess>
-  private readonly tools = new ToolServer()
   private readonly entries = new Map<string, Entry>()
   // ACP session id → live session, for permission prompts
   private readonly byACP = new Map<string, Live>()
@@ -151,25 +121,13 @@ export class Runtime {
           "Antigravity CLI (agy) is not installed. Install it from https://antigravity.google/docs/install, then run `agy` once to sign in.",
         )
       this.home ??= Home.prepare(this.options.env)
-      await this.tools.start()
       const env = { ...(this.options.env ?? process.env) }
       // Credential variables would silently switch agy away from the user's Google sign-in.
       for (const name of ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_APPLICATION_CREDENTIALS"])
         delete env[name]
       const agy = new AcpProcess({
         executable,
-        args: [
-          "acp",
-          // Each session gets its own worker; agy only accepts HTTP MCP servers from the client in this mode.
-          "--process-per-session",
-          "--gemini-dir",
-          this.home,
-          "--agent",
-          Home.AGENT,
-          // No bundled skills or slash commands: opencode already expanded its own commands, and text starting
-          // with "/" must reach the model as typed.
-          "--include-default-customizations=false",
-        ],
+        args: ["acp", "--gemini-dir", this.home],
         cwd: this.options.directory,
         env,
         permission: (request) => this.permission(request),
@@ -201,19 +159,23 @@ export class Runtime {
     }
   }
 
-  private permission(request: PermissionRequest): string | undefined {
-    const name = request.toolCall?.name ?? ""
+  // agy asks before edits and commands. opencode's permission rules decide, and prompt the user when they say "ask".
+  private async permission(request: PermissionRequest): Promise<string | undefined> {
     const live = this.byACP.get(request.sessionId)
-    // opencode asks for permission itself when it runs the tool, so its tools are always allowed here.
-    if (live && name.startsWith(Names.PREFIX) && Names.original(name, live.tools)) {
-      const option =
-        request.options.find((option) => option.kind === "allow_always") ??
-        request.options.find((option) => option.kind === "allow_once")
-      return option?.optionId
+    const allow = request.options.find((option) => option.kind === "allow_once") ?? request.options.find((o) => o.kind === "allow_always")
+    const reject = request.options.find((option) => option.kind === "reject_once") ?? request.options.find((o) => o.kind === "reject_always")
+    // agy's questions arrive as permission prompts with one option per answer. opencode can't show those choices,
+    // so they are cancelled and the model asks in its reply instead.
+    if (request.toolCall?.toolCallId?.startsWith("interaction_")) return undefined
+    if (!live?.sessionID) return reject?.optionId
+    const ask = permissionFor(request.toolCall, this.options.directory)
+    try {
+      const allowed = await this.options.ask({ sessionID: live.sessionID, agent: live.agent, ...ask })
+      return allowed ? allow?.optionId : reject?.optionId
+    } catch (error) {
+      this.options.log?.(`permission check failed: ${error}`)
+      return reject?.optionId
     }
-    // Anything else would be an Antigravity tool, which this agent should not have.
-    this.options.log?.(`rejected agy permission request for ${name || request.toolCall?.title}`)
-    return request.options.find((option) => option.kind === "reject_once" || option.kind === "reject_always")?.optionId
   }
 
   // ---------------------------------------------------------------- catalog
@@ -251,8 +213,7 @@ export class Runtime {
 
   async run(request: Request) {
     if (request.kind !== "primary" || !request.sessionID) return this.once(request)
-    const sessionID = request.sessionID
-    const entry = this.entry(sessionID)
+    const entry = this.entry(request.sessionID)
     const previous = entry.lock
     let release!: () => void
     entry.lock = new Promise<void>((resolve) => (release = resolve))
@@ -268,8 +229,7 @@ export class Runtime {
 
   /** The title agy generated for this session, if it does so within the timeout. */
   title(sessionID: string, timeoutMs: number) {
-    const entry = this.entries.get(sessionID)
-    if (!entry) return Promise.resolve(undefined)
+    const entry = this.entry(sessionID)
     if (entry.live?.title) return Promise.resolve(entry.live.title)
     return new Promise<string | undefined>((resolve) => {
       const timer = setTimeout(() => resolve(undefined), timeoutMs)
@@ -280,19 +240,12 @@ export class Runtime {
     })
   }
 
-  /** opencode stopped running the session, so a turn still waiting for tool results may never get them. */
-  idle(sessionID: string) {
-    const entry = this.entries.get(sessionID)
-    if (entry) this.armIdle(entry, true)
-  }
-
   async close() {
     for (const entry of this.entries.values()) {
       if (entry.idle) clearTimeout(entry.idle)
       await this.closeLive(entry).catch(() => {})
     }
     this.process?.kill()
-    this.tools.close()
   }
 
   private entry(sessionID: string) {
@@ -304,12 +257,8 @@ export class Runtime {
     return entry
   }
 
-  private armIdle(entry: Entry, stopped = false) {
+  private armIdle(entry: Entry) {
     if (entry.idle) clearTimeout(entry.idle)
-    // A turn holding tool calls is busy until opencode answers, however long that takes,
-    // unless opencode reported that it stopped running the session.
-    const turn = entry.live?.turn
-    if (!stopped && turn && !turn.ended && turn.held.size > 0) return
     entry.idle = setTimeout(() => {
       entry.idle = undefined
       void this.closeLive(entry)
@@ -319,7 +268,6 @@ export class Runtime {
 
   private dispose(entry: Entry, live: Live) {
     live.unsubscribe()
-    live.unregister()
     this.byACP.delete(live.acpID)
     if (entry.live === live) entry.live = undefined
   }
@@ -336,10 +284,6 @@ export class Runtime {
     const saved = (await this.options.storage.get(`sessions/${sessionID}`).catch(() => undefined)) as SessionRecord | undefined
     if (saved && typeof saved.acpID === "string" && Array.isArray(saved.history)) return saved
     return undefined
-  }
-
-  private async saveRecord(sessionID: string, record: SessionRecord | undefined) {
-    if (record) await this.options.storage.set(`sessions/${sessionID}`, record).catch(() => {})
   }
 
   /**
@@ -372,14 +316,6 @@ export class Runtime {
     entry.record ??= await this.loadRecord(sessionID)
     const groups = Fingerprint.groups(request.prompt)
     let start = this.unseen(request.prompt, groups, entry.record)
-
-    // 1. A turn waiting for tool results continues with them.
-    const waiting = entry.live?.turn
-    if (waiting && !waiting.ended && waiting.held.size > 0 && start !== undefined) {
-      if (await this.continueTurn(entry, entry.live!, request, groups, start)) return
-    }
-
-    // 2. Otherwise a new agy turn gets what it has not seen.
     if (start === undefined) {
       // agy cannot rewind or fork a conversation, so a changed history starts a new session that receives the kept
       // conversation once.
@@ -391,96 +327,26 @@ export class Runtime {
     if (entry.record?.acpID !== live.acpID) start = 0
     if (live.turn && !live.turn.ended) await this.cancelTurn(live)
 
-    const detached = entry.detached
-    entry.detached = undefined
-    let content = detached?.size ? this.detachedResults(request.prompt, start ?? 0, detached) : undefined
-    content ??= Convert.catchUp(request.prompt, start ?? 0)
+    let content = Convert.catchUp(request.prompt, start ?? 0)
     if (content.length === 0) content = [{ type: "text", text: "Continue." }]
-
     entry.record = { acpID: live.acpID, history: groups.map((group) => group.hash) }
-    await this.saveRecord(sessionID, entry.record)
+    await this.options.storage.set(`sessions/${sessionID}`, entry.record).catch(() => {})
     this.startTurn(live, content)
-    await this.readStep(entry, live, request)
-  }
-
-  // Results of tool calls that outlived agy's MCP deadline, followed by anything the user added since.
-  private detachedResults(prompt: LanguageModelV3Prompt, start: number, ids: Set<string>) {
-    const collected = Convert.collect(prompt, start)
-    const found = [...collected.results.entries()].filter(([id]) => ids.has(id))
-    if (found.length === 0) return undefined
-    const blocks: Convert.ContentBlock[] = [
-      {
-        type: "text",
-        text: "Your previous tool calls took longer than the harness allows for one call, so your turn was paused while OpenCode finished them. They have now completed. Do not run them again. Their results:",
-      },
-    ]
-    for (const [id, { part, result }] of found) {
-      blocks.push({ type: "text", text: `<tool-result id="${id}" name="${part.toolName}"${result.isError ? ' error="true"' : ""}>` })
-      for (const item of result.content as any[]) {
-        if (item.type === "text") blocks.push({ type: "text", text: item.text })
-        else if (item.type === "image") blocks.push({ type: "image", data: item.data, mimeType: item.mimeType })
-        else if (item.type === "resource") blocks.push(item)
-      }
-      blocks.push({ type: "text", text: "</tool-result>" })
-    }
-    const after = Convert.catchUp(prompt, collected.end)
-    blocks.push(...(after.length ? after : [{ type: "text" as const, text: "Continue with the task." }]))
-    return blocks
-  }
-
-  private async continueTurn(entry: Entry, live: Live, request: Request, groups: Fingerprint.Group[], start: number) {
-    const turn = live.turn!
-    const collected = Convert.collect(request.prompt, start)
-    const held = [...turn.held.values()]
-    if (collected.aborted || held.some((call) => !collected.results.has(call.id))) {
-      // A stopped opencode turn needs a fresh agy turn.
-      await this.cancelTurn(live)
-      return false
-    }
-    if (turn.deadline) clearTimeout(turn.deadline)
-    // Input opencode queued while the tools ran rides along with the last result.
-    const extra = Convert.catchUp(request.prompt, collected.end)
-      .filter((block) => block.type === "text")
-      .map((block) => (block as { text: string }).text)
-      .join("\n")
-    turn.held.clear()
-    held.forEach((call, index) => {
-      let result = collected.results.get(call.id)!.result
-      if (index === held.length - 1 && extra)
-        result = { ...result, content: [...result.content, { type: "text", text: `\n<user-message>\n${extra}\n</user-message>` }] }
-      call.resolve(result)
-    })
-    entry.record = { acpID: live.acpID, history: groups.map((group) => group.hash) }
-    await this.saveRecord(request.sessionID!, entry.record)
-    await this.readStep(entry, live, request)
-    return true
+    await this.readTurn(live, request)
   }
 
   private async ensureLive(entry: Entry, request: Request): Promise<Live> {
     const agy = await this.agy()
-    const systemHash = Fingerprint.hash(request.system)
-    const toolsHash = Fingerprint.hash(definitions(request.tools))
-    // A new system prompt or tool list needs the session reopened; resume keeps agy's history.
-    if (entry.live && (entry.live.systemHash !== systemHash || entry.live.toolsHash !== toolsHash)) await this.closeLive(entry)
+    const instructionsHash = Fingerprint.hash(request.instructions)
+    // New instructions need the session reopened; resume keeps agy's history.
+    if (entry.live && entry.live.instructionsHash !== instructionsHash) await this.closeLive(entry)
     let live = entry.live
     if (!live) {
-      const created: Live = {
-        acpID: "",
-        key: randomBytes(12).toString("hex"),
-        systemHash,
-        toolsHash,
-        tools: request.tools,
-        unsubscribe: () => {},
-        unregister: () => {},
-      }
-      created.unregister = this.tools.register(created.key, {
-        tools: () => definitions(created.tools),
-        call: (name, args) => this.onToolCall(created, name, args),
-      })
+      const created: Live = { acpID: "", instructionsHash, unsubscribe: () => {} }
       const params = {
         cwd: this.options.directory,
-        mcpServers: request.tools.length > 0 ? [this.tools.config(created.key)] : [],
-        _meta: { antigravity: { systemPrompt: { append: request.system } } },
+        mcpServers: [],
+        ...(request.instructions ? { _meta: { antigravity: { systemPrompt: { append: request.instructions } } } } : {}),
       }
       const resumeID = entry.record?.acpID
       if (resumeID) {
@@ -490,10 +356,7 @@ export class Runtime {
           () => true,
           (error) => {
             created.unsubscribe()
-            if (error instanceof AcpError && error.isAuth) {
-              created.unregister()
-              throw error
-            }
+            if (error instanceof AcpError && error.isAuth) throw error
             this.options.log?.(`could not resume agy session ${resumeID}: ${error}`)
             return false
           },
@@ -501,10 +364,7 @@ export class Runtime {
         if (resumed) created.acpID = resumeID
       }
       if (!created.acpID) {
-        const result = await agy.request("session/new", params).catch((error) => {
-          created.unregister()
-          throw error
-        })
+        const result = await agy.request("session/new", params)
         created.acpID = result.sessionId
         created.unsubscribe = agy.subscribe(created.acpID, (update) => this.onUpdate(entry, created, update))
       }
@@ -512,7 +372,13 @@ export class Runtime {
       entry.live = created
       live = created
     }
-    live.tools = request.tools
+    live.sessionID = request.sessionID
+    live.agent = request.agent
+    await this.configure(agy, live, request)
+    return live
+  }
+
+  private async configure(agy: AcpProcess, live: Live, request: Request) {
     if (live.model !== request.model) {
       await agy.request("session/set_config_option", { sessionId: live.acpID, configId: "model", value: request.model })
       live.model = request.model
@@ -522,7 +388,12 @@ export class Runtime {
       await agy.request("session/set_config_option", { sessionId: live.acpID, configId: "thought_level", value: request.effort })
       live.effort = request.effort
     }
-    return live
+    // opencode's Plan agent maps to agy's plan mode. opencode's permission rules still apply either way.
+    const mode = request.agent === "plan" ? "plan" : "default"
+    if (live.mode !== mode && (live.mode !== undefined || mode !== "default")) {
+      await agy.request("session/set_config_option", { sessionId: live.acpID, configId: "mode", value: mode }).catch(() => {})
+    }
+    live.mode = mode
   }
 
   private onUpdate(entry: Entry, live: Live, update: SessionUpdate) {
@@ -532,35 +403,7 @@ export class Runtime {
     }
     if (update.sessionUpdate === "usage_update" && typeof update.used === "number") live.used = update.used
     const turn = live.turn
-    if (!turn || turn.ended) return
-    if (
-      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-      typeof update.name === "string" &&
-      update.name.startsWith(Names.PREFIX) &&
-      typeof update.toolCallId === "string" &&
-      !turn.held.has(update.toolCallId) &&
-      !turn.announced.some((call) => call.id === update.toolCallId)
-    ) {
-      turn.announced.push({ id: update.toolCallId, name: update.name, input: stripSummary(update.rawInput ?? update.args) })
-    }
-    this.push(turn, { type: "update", update })
-  }
-
-  private onToolCall(live: Live, name: string, args: Record<string, unknown>): Promise<CallToolResult> {
-    const turn = live.turn
-    const tool = Names.original(name, live.tools)
-    if (!turn || turn.ended) return Promise.resolve({ isError: true, content: [{ type: "text", text: "This turn has ended." }] })
-    if (!tool) return Promise.resolve({ isError: true, content: [{ type: "text", text: `Tool ${name} is not available.` }] })
-    // Use agy's own id for the call when it announced one, so both sides name the call the same way.
-    const full = Names.PREFIX + name
-    let index = turn.announced.findIndex((call) => call.name === full && same(call.input, args))
-    if (index < 0) index = turn.announced.findIndex((call) => call.name === full)
-    const id = index >= 0 ? turn.announced.splice(index, 1)[0]!.id : `agy_${randomUUID()}`
-    return new Promise<CallToolResult>((resolve) => {
-      const call: HeldCall = { id, name: tool, input: args, resolve }
-      turn.held.set(id, call)
-      this.push(turn, { type: "call", call })
-    })
+    if (turn && !turn.ended) this.push(turn, { type: "update", update })
   }
 
   private push(turn: Turn, event: TurnEvent) {
@@ -571,23 +414,17 @@ export class Runtime {
   }
 
   private startTurn(live: Live, content: Convert.ContentBlock[]) {
-    const turn: Turn = { events: [], ended: false, done: Promise.withResolvers<void>(), announced: [], held: new Map() }
+    const turn: Turn = { events: [], ended: false, done: Promise.withResolvers<void>() }
     live.turn = turn
-    const agy = this.process!
-    agy.request("session/prompt", { sessionId: live.acpID, prompt: content }).then(
+    this.process!.request("session/prompt", { sessionId: live.acpID, prompt: content }).then(
       (result) => this.endTurn(live, { result }, turn),
       (error) => this.endTurn(live, { error }, turn),
     )
-    return turn
   }
 
   private endTurn(live: Live, outcome: { result?: any; error?: unknown }, turn = live.turn) {
     if (!turn || turn.ended) return
     turn.ended = true
-    if (turn.deadline) clearTimeout(turn.deadline)
-    // A held MCP request must not stay open after its turn ended.
-    for (const call of turn.held.values()) call.resolve({ isError: true, content: [{ type: "text", text: "Cancelled." }] })
-    turn.held.clear()
     this.push(turn, { type: "end", ...outcome })
     turn.done.resolve()
   }
@@ -601,15 +438,14 @@ export class Runtime {
     if (!turn.ended) this.endTurn(live, { result: { stopReason: "cancelled" } }, turn)
   }
 
-  /** Streams agy's updates as one opencode step: until the model calls tools, or the turn ends. */
-  private async readStep(entry: Entry, live: Live, request: Request) {
+  /** Streams one agy turn as one opencode step. agy runs its own tools, so they arrive as provider-executed calls. */
+  private async readTurn(live: Live, request: Request) {
     const turn = live.turn!
     const emit = request.emit
     const meta = { [PROVIDER_ID]: { session: live.acpID } }
     let block: { kind: "text" | "reasoning"; id: string } | undefined
     let counter = 0
-    const batch: HeldCall[] = []
-    let flushTimer: ReturnType<typeof setTimeout> | undefined
+    const tools = new Map<string, { name: string; done: boolean }>()
     const close = () => {
       if (!block) return
       emit({ type: `${block.kind}-end`, id: block.id, providerMetadata: meta } as LanguageModelV3StreamPart)
@@ -621,6 +457,39 @@ export class Runtime {
       block = { kind, id: `${live.acpID}:${Date.now()}:${counter++}` }
       emit({ type: `${kind}-start`, id: block.id, providerMetadata: meta } as LanguageModelV3StreamPart)
       return block.id
+    }
+    const toolCall = (update: SessionUpdate) => {
+      const id = update.toolCallId as string
+      if (!id || tools.has(id)) return
+      const name = toolName(update)
+      tools.set(id, { name, done: false })
+      close()
+      emit({
+        type: "tool-call",
+        toolCallId: id,
+        toolName: name,
+        input: JSON.stringify(toolInput(update)),
+        providerExecuted: true,
+        providerMetadata: meta,
+      })
+    }
+    const toolResult = (update: SessionUpdate) => {
+      const id = update.toolCallId as string
+      const tool = tools.get(id)
+      if (!tool || tool.done) return
+      tool.done = true
+      emit({
+        type: "tool-result",
+        toolCallId: id,
+        toolName: tool.name,
+        result: toolOutput(update) as any,
+        isError: update.status === "failed",
+        providerMetadata: meta,
+      } as LanguageModelV3StreamPart)
+    }
+    // Every shown call needs a result, or opencode would treat it as still pending.
+    const settle = (status: string) => {
+      for (const [id, tool] of tools) if (!tool.done) toolResult({ sessionUpdate: "tool_call_update", toolCallId: id, status, title: tool.name })
     }
     const usage = (final?: any) => {
       const output = final?.usage?.outputTokens ?? 0
@@ -643,87 +512,61 @@ export class Runtime {
           await new Promise<void>((resolve) => (turn.wake = resolve))
           continue
         }
-        switch (event.type) {
-          case "update": {
-            const update = event.update
-            const text = update.content?.type === "text" ? (update.content.text as string) : ""
-            if (update.sessionUpdate === "agent_message_chunk" && text) emit({ type: "text-delta", id: open("text"), delta: text })
-            if (update.sessionUpdate === "agent_thought_chunk" && text) emit({ type: "reasoning-delta", id: open("reasoning"), delta: text })
-            break
+        if (event.type === "update") {
+          const update = event.update
+          const text = update.content?.type === "text" ? (update.content.text as string) : ""
+          switch (update.sessionUpdate) {
+            case "agent_message_chunk":
+              // agy reports its own retries as message text; they are not part of the reply.
+              if (text && !RETRY_NOTICE.test(text)) emit({ type: "text-delta", id: open("text"), delta: text })
+              break
+            case "agent_thought_chunk":
+              if (text) emit({ type: "reasoning-delta", id: open("reasoning"), delta: text })
+              break
+            case "tool_call":
+            case "tool_call_update":
+              toolCall(update)
+              if (update.status === "completed" || update.status === "failed") toolResult(update)
+              break
           }
-          case "call":
-            close()
-            batch.push(event.call)
-            flushTimer ??= setTimeout(() => this.push(turn, { type: "flush" }), TOOL_BATCH_MS)
-            break
-          case "flush": {
-            for (const call of batch)
-              emit({ type: "tool-call", toolCallId: call.id, toolName: call.name, input: JSON.stringify(call.input), providerMetadata: meta })
-            emit({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" }, usage: usage(), providerMetadata: meta })
-            // The opencode step is over while the agy turn waits for results. Detach before agy's MCP deadline.
-            turn.deadline = setTimeout(() => this.detach(entry, live, turn), TOOL_DEADLINE_MS)
-            turn.deadline.unref?.()
-            return
-          }
-          case "abort":
-            close()
-            await this.cancelTurn(live)
-            return
-          case "end": {
-            close()
-            if (event.error) throw toError(event.error)
-            const stop = event.result?.stopReason
-            emit({
-              type: "finish",
-              finishReason: { unified: stop === "max_tokens" ? "length" : stop === "refusal" ? "content-filter" : "stop", raw: stop },
-              usage: usage(event.result),
-              providerMetadata: meta,
-            })
-            return
-          }
+          continue
         }
+        close()
+        if (event.type === "abort") {
+          await this.cancelTurn(live)
+          settle("cancelled")
+          return
+        }
+        settle(event.error ? "failed" : "cancelled")
+        if (event.error) throw toError(event.error)
+        const stop = event.result?.stopReason
+        emit({
+          type: "finish",
+          finishReason: { unified: stop === "max_tokens" ? "length" : stop === "refusal" ? "content-filter" : "stop", raw: stop },
+          usage: usage(event.result),
+          providerMetadata: meta,
+        })
+        return
       }
     } finally {
       request.signal.removeEventListener("abort", onAbort)
     }
   }
 
-  // An opencode tool is still running past agy's MCP deadline: end the agy turn now and deliver the results as the
-  // next prompt. Cancelling (rather than answering) keeps agy from spending a model request on a placeholder.
-  private detach(entry: Entry, live: Live, turn: Turn) {
-    if (live.turn !== turn || turn.ended || turn.held.size === 0) return
-    entry.detached = new Set(turn.held.keys())
-    this.options.log?.(`detaching ${turn.held.size} long-running tool call(s) from agy session ${live.acpID}`)
-    void this.cancelTurn(live)
-  }
-
-  /** Side requests (titles, summaries, compaction) run in a throwaway session without tools. */
+  /** Side requests (titles, summaries, compaction) run in a throwaway agy session. */
   private async once(request: Request) {
     const agy = await this.agy()
-    const created = await agy.request("session/new", {
-      cwd: this.options.directory,
-      mcpServers: [],
-      _meta: { antigravity: { systemPrompt: { append: request.system } } },
-    })
-    const live: Live = {
-      acpID: created.sessionId,
-      key: "",
-      systemHash: "",
-      toolsHash: "",
-      tools: [],
-      unsubscribe: () => {},
-      unregister: () => {},
-    }
+    const created = await agy.request("session/new", { cwd: this.options.directory, mcpServers: [] })
+    const live: Live = { acpID: created.sessionId, instructionsHash: "", unsubscribe: () => {} }
     const entry: Entry = { lock: Promise.resolve(), titleWaiters: [] }
     live.unsubscribe = agy.subscribe(live.acpID, (update) => this.onUpdate(entry, live, update))
     try {
-      await agy.request("session/set_config_option", { sessionId: live.acpID, configId: "model", value: request.model })
-      if (request.effort)
-        await agy.request("session/set_config_option", { sessionId: live.acpID, configId: "thought_level", value: request.effort })
+      await this.configure(agy, live, request)
+      // The task (title, summary) is in opencode's messages; opencode's harness system prompt is not sent.
       const history = request.prompt.some((message) => message.role === "assistant" || message.role === "tool")
       const content = history ? Convert.catchUp(request.prompt, 0) : Convert.messages(request.prompt, false)
       this.startTurn(live, content.length ? content : [{ type: "text", text: "Continue." }])
-      await this.readStep(entry, live, { ...request, tools: [] })
+      await this.readTurn(live, request)
     } finally {
       live.unsubscribe()
       await agy.request("session/close", { sessionId: live.acpID }).catch(() => {})
@@ -731,9 +574,83 @@ export class Runtime {
   }
 }
 
+const RETRY_NOTICE = /^\s*⚠ API error \(attempt \d+\)/
+
 function flatten(options: any[]): Array<{ value: string; name?: string }> {
   // Select options may be grouped
   return options.flatMap((option) => (Array.isArray(option?.options) ? flatten(option.options) : [option]))
+}
+
+function toolName(update: SessionUpdate) {
+  const name = typeof update.name === "string" && update.name ? update.name : typeof update.kind === "string" ? update.kind : "tool"
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_")
+}
+
+function toolInput(update: SessionUpdate) {
+  const input = { ...((update.rawInput ?? update.args ?? {}) as Record<string, unknown>) }
+  delete input.toolSummary
+  if (typeof update.title === "string" && update.title) input.title ??= update.title
+  return input
+}
+
+function toolOutput(update: SessionUpdate) {
+  const parts: string[] = []
+  for (const item of (update.content ?? []) as any[]) {
+    if (item?.type === "content" && item.content?.type === "text") parts.push(item.content.text)
+    if (item?.type === "diff") parts.push(`${item.path}\n${unifiedDiff(item.oldText ?? "", item.newText ?? "")}`)
+  }
+  const raw = update.rawOutput
+  return {
+    title: update.title ?? "",
+    status: update.status ?? "",
+    output: parts.length > 0 ? parts.join("\n") : raw === undefined ? "" : typeof raw === "string" ? raw : JSON.stringify(raw),
+  }
+}
+
+// A compact line diff, so edits read well in opencode's tool output.
+function unifiedDiff(before: string, after: string) {
+  const a = before.split("\n")
+  const b = after.split("\n")
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length
+  let endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--
+    endB--
+  }
+  return [...a.slice(start, endA).map((line) => `-${line}`), ...b.slice(start, endB).map((line) => `+${line}`)].join("\n")
+}
+
+/** opencode permission for an agy tool call. Actions match opencode's own tools, so its rules apply as usual. */
+export function permissionFor(toolCall: PermissionRequest["toolCall"], directory: string) {
+  const call = toolCall as any
+  const input = (call.rawInput ?? call.args ?? {}) as Record<string, any>
+  const name = String(call.name ?? "")
+  const kind = String(call.kind ?? "")
+  const paths = [
+    ...((call.locations ?? []) as Array<{ path?: string }>).map((location) => location.path),
+    input.Path,
+    input.TargetFile,
+    input.AbsolutePath,
+    input.path,
+    input.file_path,
+  ].filter((path): path is string => typeof path === "string" && path.length > 0)
+  const absolute = [...new Set(paths.map((path) => (path.startsWith("/") ? path : `${directory}/${path}`)))]
+  const metadata = { agy: { tool: name, title: call.title } }
+  if (kind === "execute" || name === "run_command") {
+    const command = String(input.CommandLine ?? input.command ?? call.title ?? name)
+    return { action: "shell", resources: [command], save: [command], metadata }
+  }
+  if (kind === "edit" || kind === "delete" || kind === "move" || /write|edit|replace|delete/.test(name))
+    return { action: "edit", resources: absolute.length ? absolute : ["*"], save: ["*"], metadata }
+  if (kind === "read" || name === "read_file") return { action: "read", resources: absolute.length ? absolute : ["*"], metadata }
+  if (name === "search_web") return { action: "websearch", resources: [String(input.query ?? input.Query ?? "*")], metadata }
+  if (kind === "fetch" || /url|fetch|browser/.test(name)) {
+    const url = String(input.Url ?? input.url ?? input.URL ?? "*")
+    return { action: "webfetch", resources: [url], metadata }
+  }
+  return { action: name || "agy", resources: [String(call.title ?? name ?? "*")], metadata }
 }
 
 export function toError(error: unknown) {

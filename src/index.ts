@@ -1,18 +1,19 @@
-// opencode-agy: use Google's Antigravity CLI (`agy`) as an opencode provider, the same way opencode's built-in
-// Claude Agent provider uses Claude Code. opencode runs the user's own `agy` through its official Agent Client
-// Protocol server (`agy acp`); it never reads agy's credentials or talks to Google itself.
+// opencode-agy: use Google's Antigravity CLI (`agy`) as an opencode provider. opencode runs the user's own `agy`
+// through its official Agent Client Protocol server (`agy acp`), the way Zed, JetBrains and t3code do. It never reads
+// agy's credentials, never talks to Google itself, and never sends opencode's own harness prompt or tools to agy.
 
 import type { Plugin } from "@opencode/plugin"
 import { existsSync } from "node:fs"
 import { delimiter, join } from "node:path"
-import { AgyLanguageModel, KIND_HEADER } from "./model.ts"
+import { AGENT_OPTION, AgyLanguageModel, INSTRUCTIONS_OPTION, KIND_HEADER } from "./model.ts"
 import { PROVIDER_ID, Runtime } from "./runtime.ts"
-import { toolFlags } from "./convert.ts"
 
 const PACKAGE = "opencode-agy"
 const METHOD_ID = "agy-login"
 const CATALOG_KEY = "catalog"
 const DEFAULT_CONTEXT = 1_048_576
+// The user's own instruction files: AGENTS.md and `instructions` from opencode config.
+const USER_INSTRUCTIONS = new Set(["core/instructions"])
 
 interface CatalogModel {
   id: string
@@ -52,7 +53,15 @@ function toModel(model: CatalogModel): any {
   }
 }
 
-const isAborted = (value: any) => value?.error?.type === "aborted" || value?.type === "aborted"
+function userInstructions(system: ReadonlyArray<{ text: string; metadata?: any }>) {
+  const texts: string[] = []
+  for (const part of system) {
+    const sources = part.metadata?.experimental?.instructions
+    if (!Array.isArray(sources)) continue
+    for (const source of sources) if (USER_INSTRUCTIONS.has(source?.key) && source.text) texts.push(source.text)
+  }
+  return texts.join("\n\n")
+}
 
 const plugin: Plugin.Plugin = {
   id: "opencode-agy",
@@ -62,6 +71,21 @@ const plugin: Plugin.Plugin = {
       directory: ctx.location.directory,
       storage: { get: (key) => ctx.storage.get(key), set: (key, value) => ctx.storage.set(key, value) },
       executable: () => findAgy(),
+      // agy's permission prompts go through opencode's permission rules, which ask the user when needed.
+      ask: (input) =>
+        ctx.permission
+          .assert({
+            sessionID: input.sessionID as any,
+            ...(input.agent ? { agent: input.agent as any } : {}),
+            action: input.action,
+            resources: input.resources,
+            ...(input.save ? { save: input.save } : {}),
+            ...(input.metadata ? { metadata: input.metadata } : {}),
+          })
+          .then(
+            () => true,
+            () => false,
+          ),
       log: process.env.OPENCODE_AGY_DEBUG ? log : undefined,
     })
 
@@ -108,14 +132,8 @@ const plugin: Plugin.Plugin = {
       (event) => {
         // agy chooses its own output budget.
         delete event.options.maxTokens
-        // Remember tool errors before the AI SDK bridge flattens error results to plain text.
-        for (const message of event.messages as any[]) {
-          if (!Array.isArray(message.content)) continue
-          for (const part of message.content) {
-            if (part?.type !== "tool-result" || part.result?.type !== "error") continue
-            toolFlags.set(part.id, { error: true, aborted: isAborted(part.result.value) })
-          }
-        }
+        event.options[AGENT_OPTION] = event.agent
+        event.options[INSTRUCTIONS_OPTION] = userInstructions(event.system)
       },
       { providerID: PROVIDER_ID },
     )
@@ -138,22 +156,6 @@ const plugin: Plugin.Plugin = {
       },
       { providerID: PROVIDER_ID },
     )
-
-    let stopped = false
-    void (async () => {
-      try {
-        const events = ctx.event.subscribe({
-          types: ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"] as any,
-        })
-        for await (const event of events as AsyncIterable<any>) {
-          if (stopped) break
-          const sessionID = event?.data?.sessionID
-          if (typeof sessionID === "string") runtime.idle(sessionID)
-        }
-      } catch (error) {
-        log(`event subscription ended: ${error}`)
-      }
-    })()
 
     const report = async (status: { status: "needs_auth"; message: string; url?: string } | undefined) => {
       const connection = await ctx.integration.connection.active(PROVIDER_ID).catch(() => undefined)
@@ -189,7 +191,6 @@ const plugin: Plugin.Plugin = {
     })()
 
     return async () => {
-      stopped = true
       await runtime.close()
     }
   },

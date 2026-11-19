@@ -36,7 +36,7 @@ export interface Options {
   readonly cwd: string
   readonly env: NodeJS.ProcessEnv
   /** Answers agy's permission prompts. Returns the chosen optionId, or undefined to cancel. */
-  readonly permission: (request: PermissionRequest) => string | undefined
+  readonly permission: (request: PermissionRequest) => Promise<string | undefined> | string | undefined
 }
 
 export class AcpProcess {
@@ -131,11 +131,15 @@ export class AcpProcess {
 
   private answer(message: any) {
     if (message.method === "session/request_permission") {
-      const optionId = this.options.permission(message.params)
-      this.write({
-        id: message.id,
-        result: { outcome: optionId === undefined ? { outcome: "cancelled" } : { outcome: "selected", optionId } },
-      })
+      Promise.resolve()
+        .then(() => this.options.permission(message.params))
+        .catch(() => undefined)
+        .then((optionId) =>
+          this.write({
+            id: message.id,
+            result: { outcome: optionId === undefined ? { outcome: "cancelled" } : { outcome: "selected", optionId } },
+          }),
+        )
       return
     }
     // We advertise no client file system, terminal or elicitation support, so agy should never ask for them.
