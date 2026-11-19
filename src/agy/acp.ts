@@ -1,6 +1,5 @@
 // JSON-RPC client for `agy acp`, the official Agent Client Protocol server in Antigravity CLI.
-// One `agy acp --process-per-session` front process serves every session of this plugin instance; agy gives each
-// session its own worker process.
+// One `agy acp` process serves every session of this plugin instance.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 

@@ -1,7 +1,7 @@
 {
   "name": "opencode-agy",
   "version": "0.1.0",
-  "description": "OpenCode provider that runs Google's Antigravity CLI (agy) through its official ACP server, the same way OpenCode's Claude Agent runs Claude Code.",
+  "description": "Use Google's Antigravity CLI (agy) as an OpenCode provider through its official ACP server (agy acp).",
   "type": "module",
   "license": "MIT",
   "exports": {

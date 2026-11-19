@@ -329,6 +329,9 @@ export class Runtime {
 
     let content = Convert.catchUp(request.prompt, start ?? 0)
     if (content.length === 0) content = [{ type: "text", text: "Continue." }]
+    this.options.log?.(
+      `${sessionID} → agy ${live.acpID}: ${start ? "continue" : "fresh"}, sending ${content.length} block(s), ${JSON.stringify(content).length} chars`,
+    )
     entry.record = { acpID: live.acpID, history: groups.map((group) => group.hash) }
     await this.options.storage.set(`sessions/${sessionID}`, entry.record).catch(() => {})
     this.startTurn(live, content)
@@ -539,6 +542,7 @@ export class Runtime {
         }
         settle(event.error ? "failed" : "cancelled")
         if (event.error) throw toError(event.error)
+        this.options.log?.(`agy ${live.acpID} turn usage: ${JSON.stringify(event.result?.usage ?? {})}`)
         const stop = event.result?.stopReason
         emit({
           type: "finish",
