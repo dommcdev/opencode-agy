@@ -34,13 +34,15 @@ Each OpenCode session maps to one ACP session in one long-lived `agy acp` proces
   behaviour, exactly as in the terminal. Its tool calls (`read_file`, `run_command`, `edit_file`, …) show up in
   OpenCode as tool parts that agy ran itself.
 - **OpenCode is the client.** It shows replies and thinking, keeps the history, and answers agy's permission prompts.
-- **One permission system.** When agy asks before running a command or editing a file, the plugin evaluates
-  OpenCode's own permission rules (actions `shell`, `edit`, `read`, `webfetch` and `websearch`). Those rules prompt
-  you when they say `ask`. OpenCode's Plan agent also switches agy to its plan mode.
+- **OpenCode answers agy's permission prompts.** When agy asks, for example before running a command or touching
+  files outside the workspace, the plugin evaluates OpenCode's own permission rules (actions `shell`, `edit`, `read`,
+  `webfetch` and `websearch`). Those rules prompt you when they say `ask`. Like every ACP client, agy's defaults let
+  it read and edit files inside the workspace without asking. OpenCode's Plan agent switches agy to its plan mode.
 - **Isolated config.** agy runs with a private home (`~/.local/share/opencode-agy/gemini`), so your `~/.gemini`
   settings, global rules, skills, hooks and MCP servers don't apply. This is the same idea as Claude Agent ignoring
   `~/.claude`. Your OpenCode instruction files (AGENTS.md and `instructions`) are appended to agy's prompt instead.
-- **History stays in OpenCode.** agy only receives input it hasn't seen. A normal turn sends just the new message. If
+- **History stays in OpenCode.** agy only receives input it hasn't seen. A normal turn sends just the new message, and
+  OpenCode's per-request `<system-reminder>`s (Plan mode, for example) don't count as history changes. If
   the history changes under it (edit, undo, or a switch from another provider), agy starts a new session that gets the
   kept conversation once, inside a `<conversation-checkpoint>`, because agy can't rewind or fork. A plugin or server
   restart resumes the same agy session with `session/resume`.
@@ -98,6 +100,7 @@ stayed at 99% of the five-hour Gemini window through all of development and test
 - agy's multiple-choice questions arrive as permission prompts that OpenCode can't display. They are cancelled, and
   the model asks in its reply instead.
 - Editing or undoing earlier messages costs one resend of the kept conversation, since agy can't rewind.
+- OpenCode permission rules can't restrict agy's edits inside the workspace, because agy doesn't ask for those.
 - Compaction and other side requests run in a throwaway agy session. OpenCode's system prompt is not sent there
   either.
 - After changing the plugin's code, run `opencode service restart`. The background server caches loaded modules.

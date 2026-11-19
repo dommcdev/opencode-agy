@@ -171,6 +171,7 @@ export class Runtime {
     const ask = permissionFor(request.toolCall, this.options.directory)
     try {
       const allowed = await this.options.ask({ sessionID: live.sessionID, agent: live.agent, ...ask })
+      this.options.log?.(`permission ${ask.action}(${ask.resources.join(", ")}) for ${live.agent ?? "?"}: ${allowed ? "allowed" : "rejected"}`)
       return allowed ? allow?.optionId : reject?.optionId
     } catch (error) {
       this.options.log?.(`permission check failed: ${error}`)
@@ -299,7 +300,8 @@ export class Runtime {
     // Replies this ACP session wrote are already in agy's history.
     while (matched < groups.length && groups[matched]!.role === "assistant" && this.ours(prompt, groups[matched]!, record.acpID))
       matched++
-    return groups[matched]?.start ?? prompt.length
+    // Everything after the last seen group is new, including messages without a fingerprint such as reminders.
+    return matched > 0 ? groups[matched - 1]!.end : 0
   }
 
   // Assistant messages carry the ACP session that wrote them in their provider metadata.

@@ -39,12 +39,17 @@ function inputValue(input: unknown) {
   }
 }
 
+// opencode injects reminders (such as Plan mode's) for one request and moves them on the next, so they are not part
+// of the conversation's identity.
+const REMINDER = /^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/
+
 // Thinking and provider options are replayed differently depending on the target model, so they don't count.
 function visible(message: Exclude<LanguageModelV3Message, { role: "system" }>) {
   const parts: unknown[] = []
   let text = ""
   for (const part of message.content) {
     if (part.type === "reasoning") continue
+    if (part.type === "text" && REMINDER.test(part.text)) continue
     if (part.type === "text") {
       text += part.text
       continue

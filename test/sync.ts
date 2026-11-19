@@ -87,5 +87,15 @@ const lastLog = () => logs.filter((l) => l.includes("sending")).at(-1) ?? ""
   check("next turn only sends the new message", /noreh/i.test(b.text) && lastLog().includes("continue"), `${JSON.stringify(b.text.slice(0, 40))} | ${lastLog()}`)
 }
 
+// 4. opencode's per-request reminders (Plan mode) move between requests without counting as a history change.
+{
+  const session = "ses_sync_reminder_" + Date.now()
+  const reminder = (text: string): LanguageModelV3Message => user(`<system-reminder>\n${text}\n</system-reminder>`)
+  const a = await step(session, [reminder("You are in Plan mode."), user("Reply with just: planning")])
+  const prompt: LanguageModelV3Prompt = [user("Reply with just: planning"), a.reply, reminder("Reply with just: still planning")]
+  const b = await step(session, prompt)
+  check("moved reminder continues the session", lastLog().includes("continue") && /still planning/i.test(b.text), `${JSON.stringify(b.text.slice(0, 40))} | ${lastLog()}`)
+}
+
 await runtime.close()
 process.exit(0)
